@@ -387,9 +387,13 @@ class Connection(object):
         condition.wait(timeout)
         condition.release()
 
-        if data in self.echo_conditions:
-            return data
-        raise TimeoutError()
+        self.echo_lock.acquire()
+        try:
+            if data in self.echo_conditions:
+                del self.echo_conditions[data]
+                raise TimeoutError()
+        finally:
+            self.echo_lock.release()
 
     def sendEchoReq(self, data):
         p = Packet(constants.REQ, constants.ECHO_REQ, data)
@@ -407,7 +411,9 @@ class Connection(object):
 
         if not condition:
             return False
+        condition.acquire()
         condition.notifyAll()
+        condition.release()
         return True
 
     def handleOptionRes(self, option):
@@ -708,7 +714,7 @@ class Packet(object):
 
 
 class BaseClientServer(object):
-    def __init__(self, client_id=None):
+    def __init__(self, client_id=None, keepalive_interval=300):
         if client_id:
             self.client_id = convert_to_bytes(client_id)
             self.log = logging.getLogger("gear.BaseClientServer.%s" %
@@ -719,6 +725,11 @@ class BaseClientServer(object):
         self.running = True
         self.active_connections = []
         self.inactive_connections = []
+
+        # Spawn a thread for each active connection that will periodically
+        # send ECHO_REQ to the server.
+        self.keepalive_interval = keepalive_interval
+        self.connections_keepalive_workers = {}
 
         self.connection_index = -1
         # A lock and notification mechanism to handle not having any
@@ -736,6 +747,21 @@ class BaseClientServer(object):
                                                target=self._doConnectLoop)
         self.connect_thread.daemon = True
         self.connect_thread.start()
+
+    def _checkServerConnection(self, conn, keepalive_interval):
+        counter = keepalive_interval
+        try:
+            # XXX(kklimonda): this check is probably atomic due to GIL
+            while conn in self.active_connections:
+                counter -= 1
+                if counter == 0:
+                    conn.echo()
+                    counter = keepalive_interval
+                time.sleep(1)
+            self.log.debug("Connection has been lost")
+        except TimeoutError:
+            self.log.warning("Timed out while waiting for ECHO_RES from the server. Disconnecting.")
+            self._lostConnection(conn)
 
     def _doConnectLoop(self):
         # Outer run method of the reconnection thread
@@ -778,6 +804,14 @@ class BaseClientServer(object):
             self.connections_condition.acquire()
             self.inactive_connections.remove(conn)
             self.active_connections.append(conn)
+            keepalive_thread = threading.Thread(
+                name="Echo worker %s:%s" % (conn.host, conn.port),
+                target=self._checkServerConnection,
+                args=(conn, self.keepalive_interval)
+            )
+            keepalive_thread.daemon = True
+            keepalive_thread.start()
+            self.connections_keepalive_workers[conn] = keepalive_thread
             self.connections_condition.notifyAll()
             os.write(self.wake_write, b'1\n')
             self.connections_condition.release()
@@ -812,6 +846,12 @@ class BaseClientServer(object):
             jobs = list(conn.related_jobs.values())
             if conn in self.active_connections:
                 self.active_connections.remove(conn)
+                keepalive_thread = self.connections_keepalive_workers.pop(conn)
+                # if we have reached this place from _checkServerConnection,
+                # that means we are on the keepalive thread, and
+                # its loop has already terminated.
+                if keepalive_thread != threading.current_thread():
+                    keepalive_thread.join()
             if conn not in self.inactive_connections:
                 self.inactive_connections.append(conn)
         finally:
@@ -1147,6 +1187,10 @@ class BaseClientServer(object):
             connection.disconnect()
         self.active_connections = []
         self.inactive_connections = []
+        # make sure that all keepalive threads exit after we've cleaned-up
+        # active connections.
+        for _, thread in self.connections_keepalive_workers.items():
+            thread.join()
         os.close(self.wake_read)
         os.close(self.wake_write)
 
@@ -3078,6 +3122,10 @@ class Server(BaseClientServer):
             self.handleACLSelfRevoke(request)
 
         self.log.debug("Finished handling admin request %s" % (request,))
+
+    def handleEchoReq(self, packet):
+        p = Packet(constants.RES, constants.ECHO_RES, packet.data)
+        packet.connection.sendPacket(p)
 
     def _cancelJob(self, request, job, queue):
         if self.acl:
